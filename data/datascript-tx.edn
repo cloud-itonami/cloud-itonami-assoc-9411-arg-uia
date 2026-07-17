@@ -1,0 +1,25 @@
+;; data/datascript-tx.edn — DataScript tx-data derived from src/association/facts.cljc
+;; `association.facts/catalog` (ADR-2607141700 Wave 0). Same shape as sibling files.
+
+[#:association-rule{:id "uia.founding-1887-02-07"
+                     :title "Unión Industrial Argentina (UIA) founded 7 February 1887 via a merger of two predecessor industrial associations, at an assembly of ~900 people (uia.org.ar official '130 años' article, independently corroborated by Argentina's own government site argentina.gob.ar, es.wikipedia.org, and Wikidata Q4789403's inception statement)"
+                     :association "uia"
+                     :isic "9411"
+                     :country "ARG"
+                     :kind :governance-program
+                     :url "https://www.uia.org.ar/general/2467/130-anos-trabajando-por-el-desarrollo-industrial/"
+                     :url-provenance :official-uia-org-ar
+                     :established-date "1887-02-07"
+                     :retrieved-at "2026-07-17"
+                     :topic [:governance]}
+ #:association-rule{:id "uia.first-own-headquarters-1913"
+                     :title "UIA inaugurated its first own headquarters, at Cangallo 2461 (today Presidente Perón), Buenos Aires, on 27 September 1913 (es.wikipedia.org, matching an independent WebSearch corroboration)"
+                     :association "uia"
+                     :isic "9411"
+                     :country "ARG"
+                     :kind :governance-program
+                     :url "https://es.wikipedia.org/wiki/Uni%C3%B3n_Industrial_Argentina"
+                     :url-provenance :wikipedia-corroborated
+                     :established-date "1913-09-27"
+                     :retrieved-at "2026-07-17"
+                     :topic [:governance]}]
