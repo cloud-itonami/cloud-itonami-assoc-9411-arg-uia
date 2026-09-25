@@ -46,11 +46,25 @@ municipality
 ([`cloud-itonami-municipality-arg-buenos-aires`](https://github.com/cloud-itonami/cloud-itonami-municipality-arg-buenos-aires)),
 and association (this repo).
 
-The 7 February 1887 founding date is **quadruply corroborated**:
-`uia.org.ar`'s own official "130 años" article, Argentina's own
-national government site (`argentina.gob.ar`), `es.wikipedia.org`,
-and Wikidata (Q4789403)'s own inception statement all independently
-agree.
+23 entries, each carrying the page it came from (`:source-article`)
+and the verbatim Spanish span it rests on (`:source-quote`). 21 are
+UIA's own pages on `uia.org.ar` (¿Qué es la UIA?, Departamentos and
+eight department pages, the CEU page, the Día de la Industria agenda
+page, and seven dated Novedades posts). The 7 February 1887 founding
+day is cited from the Argentine government's own note on
+`argentina.gob.ar`, whose first sentence names it. The 27 September
+1913 first headquarters is cited from `es.wikipedia.org`, a secondary
+source named as one (`:wikipedia-es`).
+
+The July citation for the founding date,
+`uia.org.ar/general/2467/130-anos-trabajando-por-el-desarrollo-industrial/`,
+answers **404** since UIA rebuilt its site (measured 2026-09-25 UTC),
+so it is no longer cited. The live site gives the founding only as a
+year ("Desde 1887"), and that is recorded at year precision.
+
+No personal names of office-holders are persisted. The quotes stop
+before each name, and `test/association/facts_test.kotoba` pins that
+they still do.
 
 **A rejected source error**: a separate `uia.org.ar` page claims a
 predecessor organization was founded in "1785" — historically
@@ -72,11 +86,27 @@ fabricate one.
 
 ## Data
 
-- `src/association/facts.cljc` — the catalog, source of truth.
+- `data/datascript-tx.edn` — the catalog. The facts are authored here
+  and nowhere else.
+- `src/association/facts.kotoba`, `src/association_facts.kotoba` —
+  the Clojure and Kotoba readings, **generated** from the data file by
+  `scripts/gen-kotoba-port.cljk`. Do not hand-edit them.
 - `schema/association-rule.edn` — DataScript schema.
-- `data/datascript-tx.edn` — derived DataScript tx-data (query this
-  alongside other `cloud-itonami`/`etzhayyim` compliance-fact sources via
-  `com-junkawasaki/root`'s `scripts/compliance-fact-query.cljs`).
+
+Check it:
+
+```sh
+kbb --backend sci scripts/gen-kotoba-port.cljk --check    # both readings match the data file
+kbb --backend sci scripts/verify-catalog.cljk             # structural, offline
+kbb --backend sci scripts/verify-catalog.cljk --live      # fetch every :url, require every quote
+```
+
+`verify-catalog` exits 0 (checked, nothing wrong), 1 (findings
+printed), or 2 (refused: it could not read the catalog or a source,
+so this is neither a pass nor a finding). `--live` needs `curl` on
+PATH. It prints `FETCHED n/n` and one `CONTROL` line per host for a
+path that cannot exist, so that a soft-404 fallback page is detected
+instead of being read as support.
 
 ## License
 
