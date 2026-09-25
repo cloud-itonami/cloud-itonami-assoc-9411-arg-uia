@@ -1,10 +1,11 @@
 (ns association.facts-test
-  (:require [clojure.test :refer [deftest is]]
-            [association.facts :as facts]))
+  (:require [clojure.test :refer [deftest is testing]]
+            [association.facts :as facts]
+            [clojure.string :as str]))
 
 (deftest uia-has-spec-basis
   (let [sb (facts/spec-basis "uia")]
-    (is (= 2 (count sb)))
+    (is (= 23 (count sb)))
     (is (every? #(= "9411" (:association-rule/isic %)) sb))
     (is (every? #(= "ARG" (:association-rule/country %)) sb))))
 
@@ -19,6 +20,82 @@
     (is (= ["ibec"] (:missing-associations c)))))
 
 (deftest by-topic-filters
-  (is (= 2 (count (facts/by-topic "uia" :governance))))
-  (is (empty? (facts/by-topic "uia" :labor)))
+  (is (= 8 (count (facts/by-topic "uia" :policy))))
+  (is (= 6 (count (facts/by-topic "uia" :governance))))
+  (is (= 4 (count (facts/by-topic "uia" :history))))
+  (is (= 4 (count (facts/by-topic "uia" :education))))
+  (is (= 3 (count (facts/by-topic "uia" :environment))))
+  (is (= 3 (count (facts/by-topic "uia" :labor))))
+  (is (= 2 (count (facts/by-topic "uia" :membership))))
+  (is (= 2 (count (facts/by-topic "uia" :trade))))
+  (is (= 1 (count (facts/by-topic "uia" :research))))
+  (is (= 1 (count (facts/by-topic "uia" :tax))))
+  (is (= 1 (count (facts/by-topic "uia" :compliance))))
+  (is (= 1 (count (facts/by-topic "uia" :energy))))
+  (is (= 1 (count (facts/by-topic "uia" :sme))))
+  (is (empty? (facts/by-topic "uia" :no-such-topic)))
   (is (empty? (facts/by-topic "ibec" :governance))))
+
+(deftest every-entry-is-individually-addressable
+  ;; A catalog that reused an id would let one entry shadow another under
+  ;; :db.unique/identity, and the count assertions above would not notice.
+  (let [sb (facts/spec-basis "uia")]
+    (is (= (count sb) (count (into #{} (map :association-rule/id sb)))))
+    (is (every? #(re-matches #"uia\.[a-z0-9-]+" (:association-rule/id %)) sb))))
+
+(def ^:private provenance->host
+  {:official-uia-org-ar "uia.org.ar"
+   :government-argentina-gob-ar "www.argentina.gob.ar"
+   :wikipedia-es "es.wikipedia.org"})
+
+(deftest every-entry-carries-a-source-and-says-whose-it-is
+  ;; Three speakers, three hosts. UIA's own site carries every entry except
+  ;; the founding day (argentina.gob.ar) and the 1913 headquarters
+  ;; (es.wikipedia.org, a secondary source named as one).
+  (doseq [e (facts/spec-basis "uia")]
+    (testing (:association-rule/id e)
+      (is (re-matches #"https://\S+" (:association-rule/url e)))
+      (is (= (provenance->host (:association-rule/url-provenance e))
+             (second (re-find #"^https://([^/]+)/" (:association-rule/url e)))))
+      (is (seq (:association-rule/source-article e)))
+      (is (seq (:association-rule/source-quote e)))
+      (is (seq (:association-rule/topic e)))
+      (is (re-matches #"\d{4}-\d{2}-\d{2}" (:association-rule/retrieved-at e)))))
+  (is (= 21 (count (filter #(= :official-uia-org-ar (:association-rule/url-provenance %))
+                           (facts/spec-basis "uia"))))))
+
+(deftest the-founding-is-not-cited-from-the-dead-july-page
+  ;; The July citation, uia.org.ar/general/2467/130-anos-..., answers 404
+  ;; since the site was rebuilt (measured 2026-09-25 UTC). The founding day is
+  ;; cited from the page that still says it.
+  (let [f (first (filter #(= "uia.founding-1887-02-07" (:association-rule/id %))
+                         (facts/spec-basis "uia")))]
+    (is (= "1887-02-07" (:association-rule/established-date f)))
+    (is (= :government-argentina-gob-ar (:association-rule/url-provenance f)))
+    (is (str/includes? (:association-rule/source-quote f) "7 de febrero de 1887")))
+  (doseq [e (facts/spec-basis "uia")]
+    (is (not (str/includes? (:association-rule/url e) "/general/"))
+        (str (:association-rule/id e) " cites a pre-rebuild uia.org.ar path"))))
+
+(deftest a-dated-entry-quotes-its-year
+  ;; The year of every dated entry is in its own quote; an undated entry says
+  ;; why instead of silently carrying nothing.
+  (doseq [e (facts/spec-basis "uia")]
+    (testing (:association-rule/id e)
+      (if-let [d (or (:association-rule/established-date e)
+                     (:association-rule/last-revised-date e))]
+        (is (str/includes? (:association-rule/source-quote e) (subs d 0 4)))
+        (is (keyword? (:association-rule/date-unknown-because e)))))))
+
+(deftest no-office-holder-is-named
+  ;; The Que es la UIA page lists the Comite Ejecutivo, Junta Directiva and
+  ;; staff; department pages list their authorities; several Novedades posts
+  ;; name the President; es.wikipedia.org names the first president. The
+  ;; quotes stop before each name; this pins that they still do.
+  (doseq [e (facts/spec-basis "uia")
+          nm ["Rappallini" "Cambaceres" "Bermúdez" "Furtado" "Drajer" "Uriburu"
+              "Abramovich" "Briner" "Gratti" "Lucania" "Caputo" "Silveyra"]]
+    (is (not (str/includes? (str (:association-rule/title e) " "
+                                 (:association-rule/source-quote e))
+                            nm))
+        (str (:association-rule/id e) " names " nm))))

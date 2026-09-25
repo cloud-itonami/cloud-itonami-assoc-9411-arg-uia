@@ -1,0 +1,395 @@
+#!/usr/bin/env kbb
+;; scripts/verify-catalog.cljk — check the UIA catalog against its own sources.
+;;
+;;   kbb --backend sci scripts/verify-catalog.cljk            structural only (offline)
+;;   kbb --backend sci scripts/verify-catalog.cljk --live     also fetch every :url and require
+;;                                              every :source-quote to be in it
+;;
+;; Ported from cloud-itonami-assoc-9411-pry-uip (ea57dde), which took it from
+;; -chl-sofofa and its predecessors. The corrections those repos measured are
+;; carried verbatim, because the conditions that produced them are properties
+;; of nbb and ClojureScript, not of any one catalog: `clojure.string` rather
+;; than `kotoba.lang.text`; `[\s\S]*?` rather than `(?is)` for the
+;; script/style strip (cljs gives `(?s)` no dotall flag); a data path that
+;; must end in `.edn`; a refusal (exit 2) that is neither a pass nor a
+;; finding; and the soft-404 control described below.
+;;
+;; Date forms. The UIA sources write dates as `25 de agosto de 2026` (the
+;; dateline of each Novedades post), `Desde 1887` / `desde 1941` (year only),
+;; and es.wikipedia.org writes `27 de setiembre de 1913` -- `setiembre` is the
+;; Río de la Plata spelling of September, accepted as a second name for
+;; month 9 only. Every form is built for the ONE date being checked, so a
+;; shifted date is still a finding. The digit and Roman-numeral forms are
+;; inherited from the port and nothing here cites them.
+;;
+;; Three speakers, three hosts, each declared in provenance->host below:
+;; UIA's own site (uia.org.ar), the Argentine government's founding-day note
+;; (argentina.gob.ar), and es.wikipedia.org for the 1913 headquarters. The
+;; first July citation, uia.org.ar/general/2467/130-anos-..., answers 404
+;; since the site was rebuilt (measured 2026-09-25 UTC); the same date is cited
+;; from argentina.gob.ar instead, whose own sentence names it.
+;;
+;; Exit codes are three-valued on purpose:
+;;
+;;   0  checked, nothing wrong
+;;   1  checked, findings printed
+;;   2  REFUSED -- could not check. Not 0, because "I could not read the
+;;      catalog" and "I read the catalog and it was fine" must not leave the
+;;      same trace, and not 1, because there is no finding to act on.
+;;
+;; Why :source-quote exists at all: reachability is not support. A URL that
+;; returns HTTP 200 and does not contain the claim looks exactly like a URL
+;; that does, so a citation can rot without anyone noticing. --live does not
+;; ask whether the citation resolves; it asks whether the document still says
+;; the thing the entry says it says.
+;;
+;; Every uia.org.ar page carries the same navigation (Socios / Departamentos
+;; y Comisiones / Centro de Estudios / Ruta X) and the same footer (the Sede
+;; Central address on Av. de Mayo, the WhatsApp line). A span copied from
+;; either is "on" every page of the site and supports nothing about the page
+;; it is cited from, so quotes are taken from each page's own body. Two
+;; department pages (Minero, UIA Joven) also repeat a paragraph of the
+;; Ambiente page; those repeated spans are not cited from them. --live also
+;; fetches, per origin, a control path that cannot exist and reports a
+;; :soft-404 finding for every source whose page is byte-for-byte the
+;; control's answer; the control line is printed either way, so a host that
+;; 404s properly and a skipped control do not look the same.
+(ns verify-catalog
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            ["child_process" :as cp]))
+
+;; process.argv holds this script's own path. Dropping a fixed count gets it
+;; wrong the moment the launcher changes, and the symptom is that the script
+;; path becomes the catalog path -- which this script then reports as
+;; unreadable, i.e. a refusal that looks like a broken catalog.
+(def argv (vec (remove #(str/ends-with? % "verify-catalog.cljs")
+                       (drop 2 (js->clj (.-argv js/process))))))
+(def live? (some #{"--live"} argv))
+(def data-path
+  (or (first (filter #(str/ends-with? % ".edn") argv)) "data/datascript-tx.edn"))
+
+(def ASSOCIATION "uia")
+(def ISIC "9411")
+(def COUNTRY "ARG")
+
+;; A provenance keyword names WHO is speaking. The host is the only thing in
+;; the entry that can corroborate it, so the two are declared together here and
+;; an unlisted keyword is a finding rather than a pass -- a new source has to
+;; say whose site it is, instead of inheriting authority for free.
+(def provenance->host
+  {;; UIA's own site: Que es la UIA, Departamentos and each department page,
+   ;; the CEU page, the agenda and the dated Novedades posts.
+   :official-uia-org-ar "uia.org.ar"
+   ;; The Argentine national government's own note on the founding day.
+   :government-argentina-gob-ar "argentina.gob.ar"
+   ;; es.wikipedia.org -- a secondary source, named as one.
+   :wikipedia-es "es.wikipedia.org"})
+
+;; Spanish months, lower case (the check compares after lower-casing the
+;; quote). Month 9 has two names: `septiembre` and `setiembre` (the
+;; es.wikipedia.org article). See the header.
+(def es-months
+  [["enero"] ["febrero"] ["marzo"] ["abril"] ["mayo"] ["junio"]
+   ["julio"] ["agosto"] ["septiembre" "setiembre"] ["octubre"] ["noviembre"] ["diciembre"]])
+
+;; Roman-numeral months, as the Statute's approval note writes them
+;; (compared lower case).
+(def roman-months ["i" "ii" "iii" "iv" "v" "vi" "vii" "viii" "ix" "x" "xi" "xii"])
+
+(defn refuse! [msg]
+  (println (str "REFUSED: " msg))
+  (println "Refusing to report a pass on a catalog this run could not read.")
+  (.exit js/process 2))
+
+(defn- read-catalog []
+  (let [txt (try (fs/readFileSync data-path "utf8")
+                 (catch :default e (refuse! (str data-path ": " (.-message e)))))
+        data (try (edn/read-string txt)
+                  (catch :default e (refuse! (str data-path " is not readable EDN: "
+                                                 (.-message e)))))]
+    (when-not (vector? data)
+      (refuse! (str data-path " is not a vector of entries (got "
+                    (if (nil? data) "nil" (type data)) ")")))
+    (when (empty? data)
+      ;; An empty catalog satisfies every per-entry assertion below. Without
+      ;; this floor, deleting the catalog would be reported as a clean run.
+      (refuse! (str data-path " holds no entries; every per-entry check would "
+                    "be vacuously true")))
+    [txt data]))
+
+(def date-re #"^\d{4}(-\d{2})?(-\d{2})?$")
+
+(defn- precision-of [d]
+  (case (count (str/split (str d) #"-")) 3 :day 2 :month 1 :year nil))
+
+(defn- host-of [u]
+  (when-let [m (re-matches #"^https://([^/]+)/.*$" (str u))]
+    (str/replace (nth m 1) #"^www\." "")))
+
+(defn- origin-of [u]
+  (when-let [m (re-matches #"^(https://[^/]+)/.*$" (str u))] (nth m 1)))
+
+(defn- date-named-in?
+  "Does `q` name `d` at `prec`, the way these sources write dates? ISO is
+   accepted too, so a source that does write ISO is not forced into words.
+   The Spanish forms (see the header) are built for THIS date only: a day,
+   a month name and a year joined by `de`/`del` (`20 de setiembre de 1936`,
+   `1 de agosto del 2022`), the Code's `17 días del mes de diciembre del año
+   2019`, day/month/year in digits (`17/09/2026`, `17-09-2026`), or day /
+   Roman month / four-digit year (`20/IX/1936`). A month-precise date must
+   name BOTH the month and the year (`mayo del 2023`, `abril de 2018`,
+   `abril 2018`); a year-precise one must contain the year."
+  [q d prec]
+  (let [q (str/lower-case q)
+        [y m dd] (str/split (str d) #"-")
+        mi (when m (dec (js/parseInt m 10)))
+        months (when mi (get es-months mi))
+        roman (when mi (get roman-months mi))
+        day-n (when dd (js/parseInt dd 10))
+        day-forms (when dd (distinct [dd (str day-n)]))
+        has? #(str/includes? q %)]
+    (or (has? (str/lower-case (str d)))
+        (case prec
+          :day (boolean
+                (or (some has? (for [dy day-forms mo months j [" de " " del "]]
+                                 (str dy " de " mo j y)))
+                    (some has? (for [dy day-forms mo months]
+                                 (str dy " días del mes de " mo " del año " y)))
+                    (some has? (for [dy day-forms sep ["/" "-"]]
+                                 (str dy sep m sep y)))
+                    (some has? (for [dy day-forms] (str dy "/" roman "/" y)))))
+          :month (boolean (some has? (for [mo months j [" de " " del " " "]]
+                                       (str mo j y))))
+          :year (has? y)
+          false))))
+(defn- structural [data]
+  (let [ids (map :association-rule/id data)
+        dups (->> ids frequencies (keep (fn [[k n]] (when (< 1 n) k))) sort)]
+    (concat
+     (for [d dups] [:duplicate-id (str d " appears " (count (filter #{d} ids)) " times")])
+     (mapcat
+      (fn [[i e]]
+        (let [at (fn [k] (get e (keyword "association-rule" k)))
+              where (str "entry " i " (" (or (at "id") "<no id>") ")")
+              f (fn [tag msg] [tag (str where ": " msg)])]
+          (concat
+           (when-not (string? (at "id")) [(f :missing-key ":id is missing or not a string")])
+           (when (and (string? (at "id"))
+                      (not (str/starts-with? (at "id") (str ASSOCIATION "."))))
+             [(f :id-shape (str ":id must start with \"" ASSOCIATION ".\""))])
+           (when-not (and (string? (at "title")) (seq (at "title")))
+             [(f :missing-key ":title is missing or empty")])
+           (when-not (= ASSOCIATION (at "association"))
+             [(f :missing-key (str ":association must be " ASSOCIATION))])
+           (when-not (= ISIC (at "isic")) [(f :missing-key (str ":isic must be " ISIC))])
+           (when-not (= COUNTRY (at "country")) [(f :missing-key (str ":country must be " COUNTRY))])
+           (when-not (keyword? (at "kind")) [(f :missing-key ":kind must be a keyword")])
+           (when-not (and (string? (at "url")) (str/starts-with? (at "url") "https://"))
+             [(f :url-shape ":url must be an https:// URL")])
+           (when-not (keyword? (at "url-provenance"))
+             [(f :missing-key ":url-provenance must be a keyword")])
+           ;; The provenance keyword and the URL must name the same speaker.
+           (when (keyword? (at "url-provenance"))
+             (let [p (at "url-provenance")
+                   expected (provenance->host p)
+                   h (host-of (at "url"))]
+               (cond
+                 (nil? expected)
+                 [(f :provenance-host
+                     (str p " is not a declared provenance; add it to "
+                          "provenance->host with the host it speaks for, or use "
+                          "one of: " (str/join ", " (sort (map str (keys provenance->host))))))]
+                 (nil? h)
+                 [(f :provenance-host (str "cannot read a host out of :url " (at "url")))]
+                 (not (or (= h expected) (str/ends-with? h (str "." expected))))
+                 [(f :provenance-host
+                     (str p " claims " expected " but :url is served by " h))]
+                 :else nil)))
+           (when-not (and (string? (at "source-article")) (seq (at "source-article")))
+             [(f :missing-key ":source-article is missing or empty")])
+           (when-not (and (string? (at "source-quote")) (seq (at "source-quote")))
+             [(f :missing-key (str ":source-quote is missing or empty -- an entry with "
+                                   "no quote cannot be checked against its own source"))])
+           (when-not (and (vector? (at "topic")) (seq (at "topic")))
+             [(f :missing-key ":topic must be a non-empty vector")])
+           (for [d [(at "established-date") (at "last-revised-date") (at "retrieved-at")]
+                 :when (and (some? d) (not (re-matches date-re (str d))))]
+             (f :date-shape (str "not an ISO date: " d)))
+           ;; A date the source does not give may be omitted -- but only out
+           ;; loud. An entry that is simply missing both dates and one that
+           ;; records why it has none must not read the same.
+           (when-not (or (at "established-date") (at "last-revised-date")
+                         (at "date-unknown-because"))
+             [(f :missing-key (str "needs :established-date or :last-revised-date, "
+                                   "or :date-unknown-because naming why the source "
+                                   "gives neither"))])
+           (when (and (at "date-unknown-because")
+                      (not (keyword? (at "date-unknown-because"))))
+             [(f :missing-key ":date-unknown-because must be a keyword")])
+           (when (and (at "date-unknown-because")
+                      (or (at "established-date") (at "last-revised-date")))
+             [(f :date-shape (str ":date-unknown-because is set on an entry that "
+                                  "does carry a date"))])
+           ;; This checker knows no derivations (see the header). Ignoring the
+           ;; key would let a derived date skip the quote check below.
+           (when (some? (at "date-derivation"))
+             [(f :date-derivation (str ":date-derivation " (at "date-derivation")
+                                       " is not checked here; the quote must name the date"))])
+           ;; How precisely the source dates the fact is a property of the
+           ;; source, not of the reader. Recording it per entry is what lets
+           ;; the judgement be checked instead of recounted.
+           (let [d (or (at "established-date") (at "last-revised-date"))
+                 p (at "date-precision")]
+             (cond
+               (and (nil? d) p)
+               [(f :date-precision ":date-precision is set on an entry with no date")]
+               (and d (nil? p))
+               [(f :date-precision (str "needs :date-precision (" (name (precision-of d))
+                                        ") saying how precisely the source dates it"))]
+               (and d p (not= p (precision-of d)))
+               [(f :date-precision (str ":date-precision " p " does not match " d
+                                        " (" (name (precision-of d)) ")"))]
+               ;; The quote must name the date. A span that is on the page but
+               ;; does not carry this date supports some other entry, not this
+               ;; one -- and reads identically until asked.
+               (and d p (string? (at "source-quote"))
+                    (not (date-named-in? (at "source-quote") d p)))
+               [(f :date-not-in-quote
+                   (str ":source-quote does not name " d " (" (name p)
+                        "); the span is not evidence for this entry's date"
+                        "\n      quote: " (at "source-quote")))]
+               :else nil)))))
+      (map-indexed vector data)))))
+
+(def ua "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+
+(defn- have? [bin]
+  (try (cp/execFileSync "sh" #js ["-c" (str "command -v " bin)] #js {:stdio "ignore"}) true
+       (catch :default _ false)))
+
+;; Named entities this decoder knows. It is deliberately not the whole HTML5
+;; table: what matters here is the punctuation and the accented letters these
+;; sources are made of. An incomplete decoder does not weaken this check, it
+;; inverts it -- the verbatim span of a page that IS serving the claim comes
+;; back as not found, which is exactly how a fabricated citation looks.
+(def ^:private named-entities
+  {"nbsp" " " "quot" "\"" "apos" "'" "lt" "<" "gt" ">"
+   "aacute" "á" "eacute" "é" "iacute" "í" "oacute" "ó" "uacute" "ú"
+   "Aacute" "Á" "Eacute" "É" "Iacute" "Í" "Oacute" "Ó" "Uacute" "Ú"
+   "agrave" "à" "egrave" "è" "igrave" "ì" "ograve" "ò" "ugrave" "ù"
+   "acirc" "â" "ecirc" "ê" "icirc" "î" "ocirc" "ô" "ucirc" "û"
+   "auml" "ä" "euml" "ë" "iuml" "ï" "ouml" "ö" "uuml" "ü"
+   "ntilde" "ñ" "Ntilde" "Ñ" "atilde" "ã" "otilde" "õ" "ccedil" "ç" "Ccedil" "Ç"
+   "sect" "§" "deg" "°" "ordm" "º" "ordf" "ª" "middot" "·" "pound" "£" "euro" "€"
+   "laquo" "«" "raquo" "»" "bdquo" "„" "ldquo" "“" "rdquo" "”"
+   "lsquo" "‘" "rsquo" "’" "sbquo" "‚" "iquest" "¿" "iexcl" "¡"
+   "ndash" "–" "mdash" "—" "hellip" "…"})
+
+(defn- decode-entities
+  "HTML entities -> characters. `&amp;` is decoded LAST, so that a document
+   that literally writes `&amp;ndash;` keeps saying `&ndash;` rather than
+   silently becoming a dash."
+  [s]
+  (-> s
+      (str/replace #"&#(\d+);"
+                   (fn [[_ d]] (js/String.fromCodePoint (js/parseInt d 10))))
+      (str/replace #"&#[xX]([0-9a-fA-F]+);"
+                   (fn [[_ h]] (js/String.fromCodePoint (js/parseInt h 16))))
+      (str/replace #"&([a-zA-Z][a-zA-Z0-9]{1,9});"
+                   (fn [[whole nm]] (get named-entities nm whole)))
+      (str/replace #"&amp;" "&")))
+
+(defn- fetch-text
+  "Returns [status text] or [status nil] -- nil text means the body arrived but
+   this run could not turn it into text, which is a refusal, not a finding.
+   A PDF source is turned into text with pdftotext when it is on PATH; without
+   it the text is nil and the run refuses (see the header)."
+  [url]
+  (let [tmp (path/join (os/tmpdir) (str "uia-src-" (hash url)))
+        status (try (str/trim (str (cp/execFileSync
+                                    "curl" #js ["-sS" "-L" "--max-time" "300"
+                                                "--compressed" "-A" ua "-o" tmp
+                                                "-w" "%{http_code}" url]
+                                    #js {:encoding "utf8"})))
+                    (catch :default e (str "curl-failed: " (.-message e))))
+        body (try (fs/readFileSync tmp) (catch :default _ nil))
+        pdf? (and body (str/starts-with? (.toString (.slice body 0 5) "utf8") "%PDF-"))
+        text (cond
+               (nil? body) nil
+               pdf? (when (have? "pdftotext")
+                      (try (str (cp/execFileSync "pdftotext" #js ["-q" tmp "-"]
+                                                 #js {:encoding "utf8"
+                                                      :maxBuffer 67108864}))
+                           (catch :default _ nil)))
+               :else (-> (.toString body "utf8")
+                         ;; [\s\S] rather than (?s). See the header: cljs does
+                         ;; not turn (?s) into a dotall JS flag, so `.` stops at
+                         ;; a newline and multi-line <style> blocks survive.
+                         (str/replace #"<(script|style|noscript)[^>]*>[\s\S]*?</\1>" " ")
+                         (str/replace #"<[^>]+>" " ")
+                         decode-entities))]
+    (try (fs/unlinkSync tmp) (catch :default _ nil))
+    [status (when text (str/replace text #"\s+" " "))]))
+
+(defn- run-live [data]
+  (when-not (have? "curl") (refuse! "curl is not on PATH"))
+  (let [urls (vec (distinct (map :association-rule/url data)))
+        fetched (reduce (fn [m u] (assoc m u (fetch-text u))) {} urls)
+        unreadable (for [[u [status text]] fetched
+                         :when (or (not (re-matches #"2\d\d" status)) (nil? text))]
+                     (str u " -> status=" status
+                          (when (nil? text) " (body could not be turned into text)")))]
+    (println (str "FETCHED\t" (- (count urls) (count unreadable)) "/" (count urls)))
+    (when (seq unreadable)
+      ;; Every quote check below would be "not found", which reads exactly like
+      ;; a fabricated citation. Refuse instead of accusing the catalog.
+      (refuse! (str "could not read " (count unreadable) " of " (count urls)
+                    " sources:\n  " (str/join "\n  " unreadable))))
+    ;; The soft-404 control. One fetch per origin of a path that cannot exist;
+    ;; a host that answers it 2xx has a fallback page, and every source on that
+    ;; host is then compared against it. A host that 404s has no fallback to
+    ;; compare against, and says so on its CONTROL line.
+    (let [origins (vec (distinct (keep origin-of urls)))
+          nonce (.toString (js/Math.floor (* 1e12 (js/Math.random))) 36)
+          controls (reduce (fn [m o]
+                             (assoc m o (fetch-text (str o "/verify-catalog-control-" nonce ".html"))))
+                           {} origins)]
+      (doseq [o origins :let [[status text] (get controls o)]]
+        (println (str "CONTROL\t" o "/<no such path> -> status=" status
+                      (if (and (re-matches #"2\d\d" status) text)
+                        " (2xx: this host has a fallback page; sources on it are compared against it)"
+                        " (no fallback page to compare against)"))))
+      (concat
+       (keep (fn [u]
+               (let [[cs ctext] (get controls (origin-of u))
+                     [_ text] (get fetched u)]
+                 (when (and cs ctext (re-matches #"2\d\d" cs) (= text ctext))
+                   [:soft-404
+                    (str u " is answered with the same page as a path that does not "
+                         "exist on " (origin-of u) " -- the URL has rotted to the host's "
+                         "fallback page, whatever HTTP status says")])))
+             urls)
+       (keep (fn [e]
+               (let [u (:association-rule/url e)
+                     q (str/replace (str (:association-rule/source-quote e)) #"\s+" " ")
+                     [_ text] (get fetched u)]
+                 (when-not (str/includes? text q)
+                   [:quote-not-in-source
+                    (str (:association-rule/id e) ": :source-quote is not in " u
+                         "\n      quote: " q)])))
+             data)))))
+
+(let [[txt data] (read-catalog)
+      findings (concat (structural data) (when live? (run-live data)))]
+  (println (str "SCANNED\t" (count data) " entries, "
+                (count (re-seq #"https?://" txt)) " citations, "
+                (count (distinct (map :association-rule/url data))) " distinct sources"
+                (if live? ", live" ", structural only")))
+  (doseq [[tag msg] findings] (println (str "  [" (name tag) "] " msg)))
+  (if (seq findings)
+    (do (println (str (count findings) " finding(s)")) (.exit js/process 1))
+    (do (println "ok") (.exit js/process 0))))
